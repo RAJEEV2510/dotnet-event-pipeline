@@ -1,6 +1,8 @@
-# EventProcessor
+# EventProcessor: High-Throughput .NET Event Pipeline
 
-A high-throughput event ingestion and processing pipeline built with .NET 7, RabbitMQ, and PostgreSQL. Designed to handle **100,000+ events per minute** with at-least-once delivery guarantees.
+![build](https://github.com/RAJEEV2510/dotnet-event-pipeline/actions/workflows/build.yml/badge.svg) ![.NET 8](https://img.shields.io/badge/.NET-8-512BD4?logo=dotnet) ![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3-FF6600?logo=rabbitmq) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
+
+A high-throughput event ingestion and processing pipeline built with .NET 8, RabbitMQ, and PostgreSQL. Designed to handle **100,000+ events per minute** with at-least-once delivery guarantees.
 
 ```
 Client --> [API + Rate Limiter] --> [In-Memory Channel] --> [Outbox Writers x3]
@@ -56,7 +58,7 @@ This project demonstrates a production-grade pipeline that actually works under 
 
 ### Prerequisites
 
-- .NET 7 SDK
+- .NET 8 SDK
 - Docker & Docker Compose
 
 ### 1. Start Infrastructure
@@ -173,7 +175,7 @@ src/
 
 ## Tech Stack
 
-- **.NET 7** -- async/await, `System.Threading.Channels`, `Parallel.ForEachAsync`
+- **.NET 8** -- async/await, `System.Threading.Channels`, `Parallel.ForEachAsync`
 - **PostgreSQL 15** -- `COPY` binary protocol, partial indexes, `SKIP LOCKED`
 - **RabbitMQ 3** -- durable queues, manual acks, dead letter exchange
 - **Npgsql** -- `NpgsqlBinaryImporter` for high-speed bulk inserts

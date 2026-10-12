@@ -36,20 +36,22 @@ namespace EventProcessor.Infrastructure.Persistence
                 ) ON COMMIT DROP;";
             await cmd.ExecuteNonQueryAsync(ct);
 
-            await using var writer = await connection.BeginBinaryImportAsync(
-                "COPY _events_staging (event_id, type, payload, created_at, processed_at) FROM STDIN (FORMAT BINARY)", ct);
-
-            foreach (var e in eventList)
+            // The importer must be closed before the next command can run on this connection
+            await using (var writer = await connection.BeginBinaryImportAsync(
+                "COPY _events_staging (event_id, type, payload, created_at, processed_at) FROM STDIN (FORMAT BINARY)", ct))
             {
-                await writer.StartRowAsync(ct);
-                await writer.WriteAsync(e.EventId, NpgsqlDbType.Uuid, ct);
-                await writer.WriteAsync(e.Type, NpgsqlDbType.Text, ct);
-                await writer.WriteAsync(e.Payload, NpgsqlDbType.Text, ct);
-                await writer.WriteAsync(AsUtc(e.CreatedAt), NpgsqlDbType.TimestampTz, ct);
-                await writer.WriteAsync(AsUtc(e.ProcessedAt), NpgsqlDbType.TimestampTz, ct);
-            }
+                foreach (var e in eventList)
+                {
+                    await writer.StartRowAsync(ct);
+                    await writer.WriteAsync(e.EventId, NpgsqlDbType.Uuid, ct);
+                    await writer.WriteAsync(e.Type, NpgsqlDbType.Text, ct);
+                    await writer.WriteAsync(e.Payload, NpgsqlDbType.Text, ct);
+                    await writer.WriteAsync(AsUtc(e.CreatedAt), NpgsqlDbType.TimestampTz, ct);
+                    await writer.WriteAsync(AsUtc(e.ProcessedAt), NpgsqlDbType.TimestampTz, ct);
+                }
 
-            await writer.CompleteAsync(ct);
+                await writer.CompleteAsync(ct);
+            }
 
             await using var insertCmd = connection.CreateCommand();
             insertCmd.CommandText = @"

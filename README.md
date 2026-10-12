@@ -7,13 +7,21 @@ A high-throughput event ingestion and processing pipeline built with .NET 8, Pos
 ```
 Client --> [API + Rate Limiter] --> [In-Memory Channel] --> [Outbox Writers x3]
                                                                   |
-                                                            [PostgreSQL]
+                                                            [PostgreSQL outbox]
                                                                   |
-                                                      [Outbox Processor] --> [RabbitMQ (10 channels)]
-                                                                                    |
-                                                                  [Consumer Workers x10] --> [Batch Processors x3]
-                                                                                                    |
-                                                                                              [PostgreSQL]
+                                                         [Outbox Processor]
+                                                                  |
+                                          +-----------------------+-----------------------+
+                                            RabbitMQ <-- Messaging:Transport --> Kafka
+                                          v                                  v
+                              [RabbitMQ: 10 pooled channels]     [Kafka: idempotent producer,
+                                          |                       6 partitions keyed by EventId]
+                                          v                                  v
+                         [10 consumers -> 3 batch processors]   [Consumer group: 1 consumer per pod]
+                                          |                                  |
+                                          +----------------+-----------------+
+                                                           v
+                                          [PostgreSQL events: COPY + ON CONFLICT dedup]
 ```
 
 ## Why This Exists
@@ -25,7 +33,9 @@ This project demonstrates a production-grade pipeline that actually works under 
 - **100k+ events/min** sustained throughput
 - **Zero data loss** via the transactional outbox pattern
 - **Backpressure-aware** from HTTP ingestion to final persistence
-- **Horizontally scalable** with `SKIP LOCKED`-based work distribution
+- **Horizontally scalable** with `SKIP LOCKED`-based work distribution and Kafka consumer groups
+- **Two brokers, one pipeline**: switch between RabbitMQ and Kafka with a single setting
+- **Runs on Kubernetes**, verified end to end on a kind cluster in CI
 
 ## Architecture
 
@@ -34,25 +44,33 @@ This project demonstrates a production-grade pipeline that actually works under 
 1. HTTP POST hits `EventsController` behind a fixed-window rate limiter (3,000 req/sec)
 2. Events are written to a bounded `Channel<T>` (100k capacity) -- zero-allocation, lock-free
 3. **3 concurrent OutboxWriterService** instances drain the channel and bulk-write to PostgreSQL using `COPY` (binary protocol), batching up to 2,000 rows per flush
-4. **OutboxProcessor** polls for unprocessed rows (1,000/batch), publishes to RabbitMQ through a **pool of 10 channels**, and marks rows as processed
+4. **OutboxProcessor** polls for unprocessed rows (1,000/batch), publishes them to the configured broker (RabbitMQ through a **pool of 10 channels**, or Kafka through an **idempotent producer**), and marks rows as processed
 5. **OutboxCleanupService** deletes processed rows older than 1 minute
 
 ### Consumer Path (Worker)
 
+**RabbitMQ** (`EventConsumerWorker`)
 1. **10 RabbitMQ consumers** with prefetch of 250 feed into a bounded `Channel<T>` (50k capacity)
 2. **3 batch processors** drain the channel and bulk-insert into the `events` table using PostgreSQL `COPY` with temp-table staging for `ON CONFLICT` dedup
 3. Failed messages are retried with exponential backoff, then routed to the Dead Letter Queue
+
+**Kafka** (`KafkaConsumerWorker`)
+1. Each worker pod joins consumer group `event-processor`; Kafka assigns it a share of the 6 partitions
+2. Messages are batched (up to 2,000 or 200 ms) and bulk-inserted with the same `COPY` + `ON CONFLICT` path
+3. Offsets are committed **only after** the batch is in PostgreSQL; failed batches go to the `events-dlq` topic
 
 ### Key Design Decisions
 
 | Decision | Why |
 |----------|-----|
-| Outbox pattern | Decouples HTTP response from RabbitMQ availability. Events are never lost even if the broker is down |
+| Outbox pattern | Decouples HTTP response from broker availability. Events are never lost even if RabbitMQ or Kafka is down |
 | `COPY` binary import | 10-50x faster than parameterized INSERTs. A batch of 2,000 rows completes in ~5ms vs ~200ms |
 | `Channel<T>` | .NET's high-performance bounded queue. Lock-free reads/writes, built-in backpressure via `BoundedChannelFullMode.Wait` |
 | RabbitMQ channel pool | `IModel` is not thread-safe. A pool of 10 channels allows concurrent publishes without contention |
 | `FOR UPDATE SKIP LOCKED` | Multiple OutboxProcessor instances can run without row-level contention. Enables horizontal scaling |
-| Temp table + `ON CONFLICT` | Worker-side dedup. `COPY` doesn't support `ON CONFLICT`, so we stage into a temp table first |
+| Temp table + `ON CONFLICT` | Worker-side dedup. `COPY` doesn't support `ON CONFLICT`, so we stage into a temp table first (inside one transaction, since the table is `ON COMMIT DROP`) |
+| Kafka key = `EventId` | Retries of the same event land on the same partition, and the database dedups any redelivery |
+| Manual offset commit | Committing after the PostgreSQL write gives at-least-once delivery; auto-commit could lose a batch on a crash |
 
 ## Getting Started
 
@@ -60,14 +78,16 @@ This project demonstrates a production-grade pipeline that actually works under 
 
 - .NET 8 SDK
 - Docker & Docker Compose
+- For Kubernetes: [kind](https://kind.sigs.k8s.io/) and `kubectl` (see [Running on Kubernetes](#running-on-kubernetes))
 
 ### 1. Start Infrastructure
 
 ```bash
-docker-compose up -d
+docker-compose up -d                    # RabbitMQ + PostgreSQL
+docker-compose --profile kafka up -d    # ...plus Kafka on localhost:9092
 ```
 
-This starts RabbitMQ (with management UI at `localhost:15672`) and PostgreSQL on port `54321`.
+This starts RabbitMQ (with management UI at `localhost:15672`) and PostgreSQL on port `54321`; the `kafka` profile adds a single-node Kafka broker.
 
 ### 2. Initialize Database
 
@@ -83,7 +103,7 @@ CREATE TABLE IF NOT EXISTS events (
     processed_at TIMESTAMP WITH TIME ZONE NOT NULL
 );
 
-CREATE INDEX idx_events_created_at ON events(created_at);
+CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
 
 CREATE TABLE IF NOT EXISTS outbox_messages (
     id BIGSERIAL PRIMARY KEY,
@@ -95,10 +115,10 @@ CREATE TABLE IF NOT EXISTS outbox_messages (
     retry_count INT DEFAULT 0
 );
 
-CREATE INDEX idx_outbox_unprocessed ON outbox_messages(id ASC)
+CREATE INDEX IF NOT EXISTS idx_outbox_unprocessed ON outbox_messages(id ASC)
     WHERE processed_at IS NULL AND retry_count < 5;
 
-CREATE INDEX idx_outbox_cleanup ON outbox_messages(processed_at)
+CREATE INDEX IF NOT EXISTS idx_outbox_cleanup ON outbox_messages(processed_at)
     WHERE processed_at IS NOT NULL;
 ```
 
@@ -113,6 +133,8 @@ dotnet run
 cd src/EventProcessor.Worker
 dotnet run
 ```
+
+To use Kafka instead of RabbitMQ, set `Messaging__Transport=Kafka` for both processes (or change `Messaging:Transport` in both `appsettings.json` files).
 
 ### 4. Send Events
 
@@ -199,11 +221,12 @@ Tested on a single machine. Horizontally scalable by running multiple API/Worker
 - **At-least-once delivery** -- outbox pattern guarantees no events are lost, even during RabbitMQ outages
 - **Backpressure** -- bounded channels reject with HTTP 503 when the system is saturated, preventing OOM
 - **Idempotent consumers** -- `ON CONFLICT (event_id) DO NOTHING` ensures duplicate processing is safe
-- **Dead Letter Queue** -- messages that fail after 3 retries are routed to `events_dlq` for manual inspection
+- **Dead letters** -- batches that fail after 3 retries go to `events_dlq` (RabbitMQ) or the `events-dlq` topic (Kafka) for manual inspection
 - **Graceful shutdown** -- all in-memory buffers are drained to PostgreSQL before the process exits
 - **Structured logging** -- Serilog with batch timing (`BATCH_COMPLETE: 2000 events in 8ms`)
 - **Rate limiting** -- fixed-window limiter protects the API from burst traffic
 - **Retry with backoff** -- exponential backoff on transient failures (2s, 4s, 8s)
+- **Kubernetes-ready** -- health probes, resource limits, HPAs, graceful shutdown window for in-flight batches
 
 ## Project Structure
 
@@ -215,13 +238,16 @@ src/
     BackgroundServices/
       OutboxQueue.cs              # Bounded Channel<T> (100k capacity)
       OutboxWriterService.cs      # 3 concurrent writers, COPY bulk insert
-      OutboxProcessor.cs          # Polls outbox, publishes to RabbitMQ
+      OutboxProcessor.cs          # Polls outbox, publishes to the configured broker
       OutboxCleanupService.cs     # Deletes processed rows
-  EventProcessor.Worker/          # RabbitMQ consumer service
-    EventConsumerWorker.cs        # 10 consumers, 3 batch processors
+    Dockerfile
+  EventProcessor.Worker/          # Consumer service (RabbitMQ or Kafka)
+    EventConsumerWorker.cs        # RabbitMQ: 10 consumers, 3 batch processors
+    KafkaConsumerWorker.cs        # Kafka: consumer group member, manual offset commit
+    Dockerfile
   EventProcessor.Domain/          # Domain entities
   EventProcessor.Application/     # Interfaces, DTOs, validators
-  EventProcessor.Infrastructure/  # PostgreSQL + RabbitMQ implementations
+  EventProcessor.Infrastructure/  # PostgreSQL, RabbitMQ and Kafka implementations
     Persistence/
       PostgreSQLEventRepository.cs      # COPY via NpgsqlBinaryImporter
       PostgreSQLOutboxRepository.cs     # COPY + bulk operations
@@ -229,8 +255,6 @@ src/
       RabbitMQPublisher.cs              # Channel pool (10 channels)
       KafkaPublisher.cs                 # Idempotent producer, keyed by EventId
       KafkaTopicInitializer.cs          # Creates topics on startup
-  EventProcessor.Worker/
-    KafkaConsumerWorker.cs        # Consumer group member, batch insert, manual offset commit
 k8s/                              # Kubernetes manifests (see "Running on Kubernetes")
 db/init.sql                       # Schema, used by Compose and Kubernetes
 kustomization.yaml                # kubectl apply -k .

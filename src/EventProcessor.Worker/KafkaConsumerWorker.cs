@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Confluent.Kafka;
 using EventProcessor.Application.DTOs;
@@ -21,6 +22,13 @@ namespace EventProcessor.Worker
 {
     // Kafka counterpart of EventConsumerWorker. Each replica joins one consumer group, so Kafka
     // spreads partitions across pods; scaling the Deployment up to the partition count adds throughput.
+    //
+    // Two stages run concurrently inside each pod:
+    //   consume loop  -> builds batches (up to MaxBatchSize or MaxBatchWaitMs) -> bounded channel
+    //   flush loop    -> COPY batch into PostgreSQL -> store offsets
+    // so the pod keeps fetching from Kafka while the previous batch is being written.
+    // Offsets are stored only after the batch is in PostgreSQL and auto-committed from there,
+    // which keeps delivery at-least-once; ON CONFLICT (event_id) absorbs any redelivery.
     public class KafkaConsumerWorker : BackgroundService
     {
         private readonly ILogger<KafkaConsumerWorker> _logger;
@@ -41,48 +49,65 @@ namespace EventProcessor.Worker
         {
             await KafkaTopicInitializer.EnsureTopicsAsync(_settings, _logger, stoppingToken);
 
-            // Consume() blocks, so run the loop on its own thread instead of a pool thread
-            await Task.Factory.StartNew(() => ConsumeLoop(stoppingToken), stoppingToken,
-                TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
-        }
-
-        private async Task ConsumeLoop(CancellationToken stoppingToken)
-        {
             var consumerConfig = new ConsumerConfig
             {
                 BootstrapServers = _settings.BootstrapServers,
                 GroupId = _settings.GroupId,
                 AutoOffsetReset = AutoOffsetReset.Earliest,
-                // Offsets are committed by hand only after a batch is safely in PostgreSQL (at-least-once)
-                EnableAutoCommit = false,
-                PartitionAssignmentStrategy = PartitionAssignmentStrategy.CooperativeSticky
+                // Commit only offsets we stored ourselves, after the PostgreSQL write
+                EnableAutoCommit = true,
+                EnableAutoOffsetStore = false,
+                AutoCommitIntervalMs = 1000,
+                PartitionAssignmentStrategy = PartitionAssignmentStrategy.CooperativeSticky,
+                // Pull large chunks per request instead of many small fetches
+                FetchMinBytes = 64 * 1024,
+                FetchWaitMaxMs = 50,
+                MaxPartitionFetchBytes = 8 * 1024 * 1024
             };
 
-            using var consumer = new ConsumerBuilder<string, string>(consumerConfig)
+            using var consumer = new ConsumerBuilder<string, byte[]>(consumerConfig)
                 .SetPartitionsAssignedHandler((_, partitions) =>
                     _logger.LogInformation("Assigned partitions: {Partitions}", string.Join(",", partitions.Select(p => p.Partition.Value))))
                 .Build();
-            using var dlqProducer = new ProducerBuilder<string, string>(new ProducerConfig
+            using var dlqProducer = new ProducerBuilder<string, byte[]>(new ProducerConfig
             {
                 BootstrapServers = _settings.BootstrapServers,
                 EnableIdempotence = true,
                 Acks = Acks.All
             }).Build();
 
-            consumer.Subscribe(_settings.Topic);
-            _logger.LogInformation("Kafka worker consuming {Topic} as group {GroupId}", _settings.Topic, _settings.GroupId);
+            var batches = Channel.CreateBounded<List<ConsumeResult<string, byte[]>>>(
+                new BoundedChannelOptions(_settings.FlushQueueDepth) { SingleReader = true, SingleWriter = true });
 
-            var batch = new List<ConsumeResult<string, string>>(_settings.MaxBatchSize);
+            consumer.Subscribe(_settings.Topic);
+            _logger.LogInformation("Kafka worker consuming {Topic} as group {GroupId} (batch {BatchSize}, wait {WaitMs} ms)",
+                _settings.Topic, _settings.GroupId, _settings.MaxBatchSize, _settings.MaxBatchWaitMs);
+
+            // Consume() blocks, so the consume loop gets its own thread
+            var consumeTask = Task.Factory.StartNew(() => ConsumeLoop(consumer, batches.Writer, stoppingToken),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            var flushTask = FlushLoop(consumer, dlqProducer, batches.Reader);
+
+            await Task.WhenAll(consumeTask, flushTask);
+            consumer.Close();
+        }
+
+        private async Task ConsumeLoop(
+            IConsumer<string, byte[]> consumer,
+            ChannelWriter<List<ConsumeResult<string, byte[]>>> output,
+            CancellationToken stoppingToken)
+        {
+            var batch = new List<ConsumeResult<string, byte[]>>(_settings.MaxBatchSize);
             var batchTimer = Stopwatch.StartNew();
 
             try
             {
                 while (!stoppingToken.IsCancellationRequested)
                 {
-                    ConsumeResult<string, string>? result;
+                    ConsumeResult<string, byte[]>? result;
                     try
                     {
-                        result = consumer.Consume(TimeSpan.FromMilliseconds(100));
+                        result = consumer.Consume(TimeSpan.FromMilliseconds(50));
                     }
                     catch (ConsumeException ex) when (!ex.Error.IsFatal)
                     {
@@ -96,12 +121,13 @@ namespace EventProcessor.Worker
                         batch.Add(result);
                     }
 
-                    // Flush on size or age, whichever comes first
+                    // Hand off on size or age, whichever comes first. WriteAsync waits when the
+                    // flusher is behind, which stops consumption (backpressure) instead of buffering forever.
                     if (batch.Count >= _settings.MaxBatchSize ||
                         (batch.Count > 0 && batchTimer.ElapsedMilliseconds >= _settings.MaxBatchWaitMs))
                     {
-                        await FlushBatchAsync(batch, consumer, dlqProducer, stoppingToken);
-                        batch.Clear();
+                        await output.WriteAsync(batch, stoppingToken);
+                        batch = new List<ConsumeResult<string, byte[]>>(_settings.MaxBatchSize);
                     }
                 }
             }
@@ -110,29 +136,38 @@ namespace EventProcessor.Worker
             }
             finally
             {
-                if (batch.Count > 0)
-                {
-                    await FlushBatchAsync(batch, consumer, dlqProducer, CancellationToken.None);
-                }
-                consumer.Close();
+                // On shutdown, hand over whatever is left so it is written before the process exits
+                if (batch.Count > 0) await output.WriteAsync(batch, CancellationToken.None);
+                output.Complete();
+            }
+        }
+
+        private async Task FlushLoop(
+            IConsumer<string, byte[]> consumer,
+            IProducer<string, byte[]> dlqProducer,
+            ChannelReader<List<ConsumeResult<string, byte[]>>> input)
+        {
+            await foreach (var batch in input.ReadAllAsync())
+            {
+                await FlushBatchAsync(batch, consumer, dlqProducer);
             }
         }
 
         private async Task FlushBatchAsync(
-            List<ConsumeResult<string, string>> batch,
-            IConsumer<string, string> consumer,
-            IProducer<string, string> dlqProducer,
-            CancellationToken ct)
+            List<ConsumeResult<string, byte[]>> batch,
+            IConsumer<string, byte[]> consumer,
+            IProducer<string, byte[]> dlqProducer)
         {
             var events = new List<Event>(batch.Count);
-            var poison = new List<ConsumeResult<string, string>>();
+            var deadLetters = new List<ConsumeResult<string, byte[]>>();
+            var processedAt = DateTime.UtcNow;
 
             foreach (var result in batch)
             {
                 try
                 {
                     var dto = JsonSerializer.Deserialize<EventDto>(result.Message.Value);
-                    if (dto == null) { poison.Add(result); continue; }
+                    if (dto == null) { deadLetters.Add(result); continue; }
 
                     events.Add(new Event
                     {
@@ -140,12 +175,12 @@ namespace EventProcessor.Worker
                         Type = dto.Type,
                         Payload = dto.Payload,
                         CreatedAt = dto.CreatedAt,
-                        ProcessedAt = DateTime.UtcNow
+                        ProcessedAt = processedAt
                     });
                 }
                 catch (JsonException)
                 {
-                    poison.Add(result);
+                    deadLetters.Add(result);
                 }
             }
 
@@ -156,31 +191,41 @@ namespace EventProcessor.Worker
                 var repository = scope.ServiceProvider.GetRequiredService<IEventRepository>();
 
                 var retryPolicy = Policy
-                    .Handle<Exception>(ex => ex is not OperationCanceledException)
+                    .Handle<Exception>()
                     .WaitAndRetryAsync(3, attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)));
 
                 // Duplicates from redelivery are absorbed by ON CONFLICT (event_id) DO NOTHING
-                await retryPolicy.ExecuteAsync(token => repository.BulkInsertAsync(events, token), ct);
+                await retryPolicy.ExecuteAsync(() => repository.BulkInsertAsync(events, CancellationToken.None));
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex)
             {
                 _logger.LogError(ex, "Max retries reached. Sending batch of {Count} to {DeadLetterTopic}.", batch.Count, _settings.DeadLetterTopic);
-                poison = batch;
+                deadLetters = batch;
             }
 
-            foreach (var result in poison)
+            foreach (var result in deadLetters)
             {
-                await dlqProducer.ProduceAsync(_settings.DeadLetterTopic, result.Message, CancellationToken.None);
+                await dlqProducer.ProduceAsync(_settings.DeadLetterTopic, result.Message);
             }
 
-            // Commit the highest offset per partition (+1 = next message to read)
-            var offsets = batch
-                .GroupBy(r => r.TopicPartition)
-                .Select(g => new TopicPartitionOffset(g.Key, g.Max(r => r.Offset.Value) + 1));
-            consumer.Commit(offsets);
+            // Store the next offset to read for each partition; the consumer auto-commits stored offsets.
+            // A partition revoked during a rebalance can't be stored: its new owner re-reads those
+            // events and the database drops the duplicates.
+            foreach (var group in batch.GroupBy(r => r.TopicPartition))
+            {
+                try
+                {
+                    consumer.StoreOffset(new TopicPartitionOffset(group.Key, group.Max(r => r.Offset.Value) + 1));
+                }
+                catch (KafkaException ex) when (ex.Error.Code == ErrorCode.Local_State)
+                {
+                    _logger.LogInformation("Partition {Partition} was revoked before its offset could be stored", group.Key.Partition.Value);
+                }
+            }
 
-            _logger.LogInformation("BATCH_COMPLETE: {Count} events in {ElapsedMs}ms ({DeadLettered} dead-lettered)",
-                batch.Count, sw.ElapsedMilliseconds, poison.Count);
+            var seconds = Math.Max(sw.Elapsed.TotalSeconds, 0.001);
+            _logger.LogInformation("BATCH_COMPLETE: {Count} events in {ElapsedMs}ms ({Rate:N0} events/sec, {DeadLettered} dead-lettered)",
+                batch.Count, sw.ElapsedMilliseconds, events.Count / seconds, deadLetters.Count);
         }
     }
 }

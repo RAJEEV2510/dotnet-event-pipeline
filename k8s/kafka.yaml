@@ -49,7 +49,7 @@ spec:
             - { name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR, value: "1" }
             - { name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR, value: "1" }
             - { name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS, value: "0" }
-            - { name: KAFKA_NUM_PARTITIONS, value: "6" }
+            - { name: KAFKA_NUM_PARTITIONS, value: "12" }
             - { name: KAFKA_LOG_DIRS, value: "/var/lib/kafka/data" }
           readinessProbe:
             tcpSocket:
@@ -57,8 +57,8 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 5
           resources:
-            requests: { cpu: 200m, memory: 512Mi }
-            limits: { memory: 1Gi }
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { memory: 2Gi }
           volumeMounts:
             - name: data
               mountPath: /var/lib/kafka/data

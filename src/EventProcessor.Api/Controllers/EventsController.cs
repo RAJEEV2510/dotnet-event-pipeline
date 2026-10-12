@@ -1,12 +1,11 @@
 using System.Threading;
 using System.Threading.Tasks;
-using EventProcessor.Api.BackgroundServices;
+using EventProcessor.Api.Ingestion;
 using EventProcessor.Application.DTOs;
-using EventProcessor.Application.Interfaces;
-using EventProcessor.Domain;
+using EventProcessor.Infrastructure.Settings;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
-using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace EventProcessor.Api.Controllers
 {
@@ -15,34 +14,34 @@ namespace EventProcessor.Api.Controllers
     [EnableRateLimiting("ingestion")]
     public class EventsController : ControllerBase
     {
-        private readonly OutboxQueue _queue;
-        private readonly ILogger<EventsController> _logger;
+        private readonly IEventIngestor _ingestor;
+        private readonly IngestSettings _settings;
 
-        public EventsController(OutboxQueue queue, ILogger<EventsController> logger)
+        public EventsController(IEventIngestor ingestor, IOptions<IngestSettings> settings)
         {
-            _queue = queue;
-            _logger = logger;
+            _ingestor = ingestor;
+            _settings = settings.Value;
         }
 
         [HttpPost]
-        public Task<IActionResult> Post([FromBody] EventDto eventDto, CancellationToken ct)
+        public async Task<IActionResult> Post([FromBody] EventDto eventDto, CancellationToken ct)
         {
-            // Push to memory queue for extreme performance
-            var outboxMessage = new OutboxMessage
-            {
-                EventId = eventDto.EventId,
-                Type = eventDto.Type,
-                Content = eventDto.Payload,
-                CreatedAt = eventDto.CreatedAt
-            };
+            return await _ingestor.IngestAsync(new[] { eventDto }, ct)
+                ? Accepted()
+                : StatusCode(503, "Server is overloaded");
+        }
 
-            if (_queue.Writer.TryWrite(outboxMessage))
-            {
-                return Task.FromResult<IActionResult>(Accepted());
-            }
+        // High-throughput path: one HTTP request carries up to Ingest:MaxBatchEvents events,
+        // so per-request overhead is paid once per batch instead of once per event
+        [HttpPost("batch")]
+        public async Task<IActionResult> PostBatch([FromBody] EventDto[] events, CancellationToken ct)
+        {
+            if (events.Length == 0) return BadRequest("Empty batch");
+            if (events.Length > _settings.MaxBatchEvents) return BadRequest($"Batch larger than {_settings.MaxBatchEvents} events");
 
-            // If queue is full, return 503 Service Unavailable or 429
-            return Task.FromResult<IActionResult>(StatusCode(503, "Server is overloaded"));
+            return await _ingestor.IngestAsync(events, ct)
+                ? Accepted(new { accepted = events.Length })
+                : StatusCode(503, "Server is overloaded");
         }
     }
 }

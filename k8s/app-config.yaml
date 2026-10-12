@@ -5,11 +5,17 @@ metadata:
   name: event-pipeline-config
 data:
   Messaging__Transport: "Kafka"
+  # "Outbox" = API -> PostgreSQL outbox -> Kafka; "Direct" = API -> Kafka (high-throughput path)
+  Ingest__Mode: "Outbox"
+  Ingest__MaxBatchEvents: "5000"
   Kafka__BootstrapServers: "kafka:9092"
   Kafka__Topic: "events"
   Kafka__DeadLetterTopic: "events-dlq"
   Kafka__GroupId: "event-processor"
-  Kafka__Partitions: "6"
+  # Partitions cap how many worker pods can consume in parallel
+  Kafka__Partitions: "12"
+  Kafka__MaxBatchSize: "10000"
+  Kafka__MaxBatchWaitMs: "200"
 ---
 apiVersion: v1
 kind: Secret

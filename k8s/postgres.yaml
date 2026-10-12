@@ -36,6 +36,9 @@ spec:
       containers:
         - name: postgres
           image: postgres:15
+          # Fewer checkpoints during sustained bulk loads. synchronous_commit stays ON:
+          # worker offsets are stored only after a commit, so a commit must survive a crash.
+          args: ["-c", "max_wal_size=4GB", "-c", "shared_buffers=512MB", "-c", "wal_compression=on"]
           ports:
             - containerPort: 5432
           envFrom:
@@ -49,8 +52,8 @@ spec:
               command: ["pg_isready", "-U", "postgres"]
             periodSeconds: 5
           resources:
-            requests: { cpu: 100m, memory: 256Mi }
-            limits: { memory: 1Gi }
+            requests: { cpu: 500m, memory: 1Gi }
+            limits: { memory: 2Gi }
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
@@ -67,4 +70,4 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            storage: 1Gi
+            storage: 4Gi

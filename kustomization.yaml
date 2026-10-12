@@ -1,0 +1,18 @@
+# Deploy everything: kubectl apply -k .
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: event-pipeline
+resources:
+  - k8s/namespace.yaml
+  - k8s/postgres.yaml
+  - k8s/kafka.yaml
+  - k8s/app-config.yaml
+  - k8s/api.yaml
+  - k8s/worker.yaml
+configMapGenerator:
+  # Mounted into /docker-entrypoint-initdb.d so Postgres creates the schema on first start
+  - name: postgres-init
+    files:
+      - db/init.sql
+generatorOptions:
+  disableNameSuffixHash: true

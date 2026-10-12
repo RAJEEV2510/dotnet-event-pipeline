@@ -1,4 +1,5 @@
 using EventProcessor.Application.Interfaces;
+using EventProcessor.Infrastructure.Messaging;
 using EventProcessor.Infrastructure.Persistence;
 using EventProcessor.Infrastructure.Settings;
 using EventProcessor.Worker;
@@ -15,7 +16,9 @@ Log.Logger = new LoggerConfiguration()
 builder.Services.AddSerilog();
 
 // Settings
+builder.Services.Configure<MessagingSettings>(builder.Configuration.GetSection("Messaging"));
 builder.Services.Configure<RabbitMQSettings>(builder.Configuration.GetSection("RabbitMQ"));
+builder.Services.Configure<KafkaSettings>(builder.Configuration.GetSection("Kafka"));
 builder.Services.Configure<PostgreSQLSettings>(builder.Configuration.GetSection("PostgreSQL"));
 
 // Connection pooling
@@ -27,7 +30,11 @@ builder.Services.AddSingleton(dataSource);
 builder.Services.AddScoped<IEventRepository, PostgreSQLEventRepository>();
 
 // Worker
-builder.Services.AddHostedService<EventConsumerWorker>();
+var messaging = builder.Configuration.GetSection("Messaging").Get<MessagingSettings>() ?? new MessagingSettings();
+if (messaging.UseKafka)
+    builder.Services.AddHostedService<KafkaConsumerWorker>();
+else
+    builder.Services.AddHostedService<EventConsumerWorker>();
 
 var host = builder.Build();
 host.Run();

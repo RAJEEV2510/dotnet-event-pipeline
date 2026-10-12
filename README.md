@@ -1,8 +1,8 @@
 # EventProcessor: High-Throughput .NET Event Pipeline
 
-![build](https://github.com/RAJEEV2510/dotnet-event-pipeline/actions/workflows/build.yml/badge.svg) ![.NET 8](https://img.shields.io/badge/.NET-8-512BD4?logo=dotnet) ![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3-FF6600?logo=rabbitmq) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
+![build](https://github.com/RAJEEV2510/dotnet-event-pipeline/actions/workflows/build.yml/badge.svg) ![.NET 8](https://img.shields.io/badge/.NET-8-512BD4?logo=dotnet) ![RabbitMQ](https://img.shields.io/badge/RabbitMQ-3-FF6600?logo=rabbitmq) ![Kafka](https://img.shields.io/badge/Kafka-3.8-231F20?logo=apachekafka) ![Kubernetes](https://img.shields.io/badge/Kubernetes-kind%20e2e%20in%20CI-326CE5?logo=kubernetes) ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-15-4169E1?logo=postgresql) ![License: MIT](https://img.shields.io/badge/License-MIT-green)
 
-A high-throughput event ingestion and processing pipeline built with .NET 8, RabbitMQ, and PostgreSQL. Designed to handle **100,000+ events per minute** with at-least-once delivery guarantees.
+A high-throughput event ingestion and processing pipeline built with .NET 8, PostgreSQL and a pluggable broker (**RabbitMQ or Kafka**). Designed to handle **100,000+ events per minute** with at-least-once delivery guarantees, and deployable to **Kubernetes** with manifests that CI tests end to end on every push.
 
 ```
 Client --> [API + Rate Limiter] --> [In-Memory Channel] --> [Outbox Writers x3]
@@ -71,7 +71,8 @@ This starts RabbitMQ (with management UI at `localhost:15672`) and PostgreSQL on
 
 ### 2. Initialize Database
 
-Connect to PostgreSQL (`localhost:54321`, user: `postgres`, password: `password`) and run:
+Docker Compose and Kubernetes both apply `db/init.sql` automatically on first start. To create the schema by hand,
+connect to PostgreSQL (`localhost:54321`, user: `postgres`, password: `password`) and run:
 
 ```sql
 CREATE TABLE IF NOT EXISTS events (
@@ -126,6 +127,61 @@ curl -X POST http://localhost:5000/api/events \
   }'
 ```
 
+## Kafka Transport
+
+The broker is chosen by configuration; nothing else in the pipeline changes:
+
+```json
+"Messaging": { "Transport": "Kafka" }   // or "RabbitMQ" (default)
+```
+
+| Concern | RabbitMQ path | Kafka path |
+|---------|---------------|------------|
+| Publish | Pooled channels, persistent messages | Idempotent producer (`enable.idempotence`, `acks=all`), LZ4, 5 ms linger to batch concurrent publishes |
+| Ordering / routing | Single queue | Keyed by `EventId`, 6 partitions |
+| Consume | 10 consumers, prefetch 250 | One consumer per pod in group `event-processor`; Kafka splits partitions across pods |
+| Delivery guarantee | Manual ack after the batch is in PostgreSQL | Manual offset commit after the batch is in PostgreSQL (auto-commit off) |
+| Duplicates | `ON CONFLICT (event_id) DO NOTHING` | Same: redelivered events after a rebalance are absorbed by the database |
+| Poison / failed batches | Dead-letter exchange `events_dlx` | Re-produced to the `events-dlq` topic, then offsets committed |
+| Scaling | More consumers per process | More worker pods, up to the partition count |
+
+Topics are created on startup by `KafkaTopicInitializer` (retrying while the broker boots). The relevant code is in
+`Infrastructure/Messaging/KafkaPublisher.cs` and `Worker/KafkaConsumerWorker.cs`.
+
+Run it locally with the `kafka` Compose profile:
+
+```bash
+docker-compose --profile kafka up -d
+# then run the API and worker with Messaging__Transport=Kafka
+```
+
+## Running on Kubernetes
+
+`k8s/` holds plain manifests, tied together by the root `kustomization.yaml`:
+
+| Manifest | What it deploys |
+|----------|-----------------|
+| `postgres.yaml` | PostgreSQL 15 StatefulSet with a PVC; schema from `db/init.sql` via a generated ConfigMap |
+| `kafka.yaml` | Single-node Kafka 3.8 in KRaft mode (no ZooKeeper) as a StatefulSet |
+| `app-config.yaml` | Shared settings (ConfigMap) and the connection string (Secret), injected as `Section__Key` env vars |
+| `api.yaml` | API Deployment with `/healthz` readiness/liveness probes, Service and CPU-based HPA (1-4 pods) |
+| `worker.yaml` | Worker Deployment (2 pods in one consumer group) and HPA capped at 6, the partition count |
+
+```bash
+docker build -f src/EventProcessor.Api/Dockerfile -t event-pipeline-api:local .
+docker build -f src/EventProcessor.Worker/Dockerfile -t event-pipeline-worker:local .
+kind create cluster && kind load docker-image event-pipeline-api:local event-pipeline-worker:local
+kubectl apply -k .
+kubectl -n event-pipeline port-forward svc/api 8080:80
+```
+
+The `kubernetes` job in `.github/workflows/build.yml` does exactly this on every push: it builds both images,
+deploys everything to a throwaway kind cluster, posts 500 events through the API, waits until all 500 are in
+PostgreSQL, and prints how the consumer group split the partitions between the worker pods.
+
+The single Kafka broker and in-cluster Secret values are for local clusters and CI. Production would use a
+3-broker cluster or a managed service (Confluent Cloud, Amazon MSK, Azure Event Hubs for Kafka) and an external secret store.
+
 ## Performance Characteristics
 
 | Component | Throughput | Bottleneck |
@@ -171,6 +227,13 @@ src/
       PostgreSQLOutboxRepository.cs     # COPY + bulk operations
     Messaging/
       RabbitMQPublisher.cs              # Channel pool (10 channels)
+      KafkaPublisher.cs                 # Idempotent producer, keyed by EventId
+      KafkaTopicInitializer.cs          # Creates topics on startup
+  EventProcessor.Worker/
+    KafkaConsumerWorker.cs        # Consumer group member, batch insert, manual offset commit
+k8s/                              # Kubernetes manifests (see "Running on Kubernetes")
+db/init.sql                       # Schema, used by Compose and Kubernetes
+kustomization.yaml                # kubectl apply -k .
 ```
 
 ## Tech Stack
@@ -178,6 +241,8 @@ src/
 - **.NET 8** -- async/await, `System.Threading.Channels`, `Parallel.ForEachAsync`
 - **PostgreSQL 15** -- `COPY` binary protocol, partial indexes, `SKIP LOCKED`
 - **RabbitMQ 3** -- durable queues, manual acks, dead letter exchange
+- **Kafka 3.8 (KRaft)** -- idempotent producer, consumer groups, manual offset commits, DLQ topic (Confluent.Kafka client)
+- **Kubernetes** -- StatefulSets, Deployments, HPA, probes, ConfigMap/Secret, Kustomize; tested on kind in GitHub Actions
 - **Npgsql** -- `NpgsqlBinaryImporter` for high-speed bulk inserts
 - **Dapper** -- lightweight ORM for read queries
 - **Polly** -- retry policies with exponential backoff

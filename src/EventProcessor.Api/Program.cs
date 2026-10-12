@@ -27,7 +27,9 @@ Log.Logger = new LoggerConfiguration()
 builder.Host.UseSerilog();
 
 // Settings
+builder.Services.Configure<MessagingSettings>(builder.Configuration.GetSection("Messaging"));
 builder.Services.Configure<RabbitMQSettings>(builder.Configuration.GetSection("RabbitMQ"));
+builder.Services.Configure<KafkaSettings>(builder.Configuration.GetSection("Kafka"));
 builder.Services.Configure<PostgreSQLSettings>(builder.Configuration.GetSection("PostgreSQL"));
 
 // Connection pooling
@@ -36,7 +38,11 @@ var dataSource = new NpgsqlDataSourceBuilder(pgConnectionString).Build();
 builder.Services.AddSingleton(dataSource);
 
 // Services
-builder.Services.AddSingleton<IEventPublisher, RabbitMQPublisher>();
+var messaging = builder.Configuration.GetSection("Messaging").Get<MessagingSettings>() ?? new MessagingSettings();
+if (messaging.UseKafka)
+    builder.Services.AddSingleton<IEventPublisher, KafkaPublisher>();
+else
+    builder.Services.AddSingleton<IEventPublisher, RabbitMQPublisher>();
 builder.Services.AddSingleton<OutboxQueue>();
 builder.Services.AddScoped<IEventRepository, PostgreSQLEventRepository>();
 builder.Services.AddScoped<IOutboxRepository, PostgreSQLOutboxRepository>();
@@ -63,6 +69,7 @@ builder.Services.AddRateLimiter(options =>
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 });
 
+builder.Services.AddHealthChecks();
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -78,5 +85,6 @@ if (app.Environment.IsDevelopment())
 app.UseSerilogRequestLogging();
 app.UseRateLimiter();
 app.MapControllers();
+app.MapHealthChecks("/healthz");
 
 app.Run();

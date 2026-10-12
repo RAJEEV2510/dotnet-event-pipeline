@@ -95,6 +95,14 @@ namespace EventProcessor.Infrastructure.Messaging
             }
         }
 
+        public async Task PublishBatchAsync(IReadOnlyList<EventDto> events)
+        {
+            foreach (var eventDto in events)
+            {
+                await PublishAsync(eventDto);
+            }
+        }
+
         public void Dispose()
         {
             _poolSemaphore.Dispose();

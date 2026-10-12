@@ -1,6 +1,6 @@
 # Every worker pod joins the same Kafka consumer group, so Kafka splits the topic's
-# partitions between them. More pods than partitions (6) would leave pods idle,
-# which is why the HPA stops at 6.
+# partitions between them. More pods than partitions (12) would leave pods idle,
+# which is why the HPA stops at 12.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,7 +39,7 @@ spec:
     kind: Deployment
     name: worker
   minReplicas: 1
-  maxReplicas: 6
+  maxReplicas: 12
   metrics:
     - type: Resource
       resource:

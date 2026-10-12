@@ -1,0 +1,26 @@
+# One-off load test, not part of the default deployment:
+#   kubectl -n event-pipeline apply -f k8s/loadtest/loadgen-job.yaml
+#   kubectl -n event-pipeline logs -f job/loadgen
+# Runs inside the cluster so the numbers aren't limited by kubectl port-forward.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: loadgen
+  namespace: event-pipeline
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: loadgen
+          image: event-pipeline-loadgen:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: TARGET_URL, value: "http://api/api/events/batch" }
+            - { name: TOTAL_EVENTS, value: "1000000" }
+            - { name: BATCH_SIZE, value: "1000" }
+            - { name: CONCURRENCY, value: "32" }
+            - { name: EVENT_TYPE, value: "load.test" }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }

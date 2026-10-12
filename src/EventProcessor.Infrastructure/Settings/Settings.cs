@@ -8,6 +8,16 @@ namespace EventProcessor.Infrastructure.Settings
         public bool UseKafka => string.Equals(Transport, "Kafka", System.StringComparison.OrdinalIgnoreCase);
     }
 
+    public class IngestSettings
+    {
+        // "Outbox": API -> PostgreSQL outbox -> broker (survives broker outages; ~2 DB writes per event)
+        // "Direct": API -> Kafka (acks=all) -> worker -> PostgreSQL (one DB write per event; needs Kafka)
+        public string Mode { get; set; } = "Outbox";
+        public int MaxBatchEvents { get; set; } = 5000;
+
+        public bool IsDirect => string.Equals(Mode, "Direct", System.StringComparison.OrdinalIgnoreCase);
+    }
+
     public class KafkaSettings
     {
         public string BootstrapServers { get; set; } = "localhost:9092";
@@ -17,8 +27,11 @@ namespace EventProcessor.Infrastructure.Settings
         public int Partitions { get; set; } = 6;
         public short ReplicationFactor { get; set; } = 1;
         public int LingerMs { get; set; } = 5;
-        public int MaxBatchSize { get; set; } = 2000;
+        public int ProducerBatchBytes { get; set; } = 1_000_000;
+        public int ProducerQueueMaxMessages { get; set; } = 1_000_000;
+        public int MaxBatchSize { get; set; } = 10_000;
         public int MaxBatchWaitMs { get; set; } = 200;
+        public int FlushQueueDepth { get; set; } = 2;
     }
 
     public class RabbitMQSettings

@@ -28,13 +28,14 @@ jobs:
         run: |
           docker build -f src/EventProcessor.Api/Dockerfile -t event-pipeline-api:local .
           docker build -f src/EventProcessor.Worker/Dockerfile -t event-pipeline-worker:local .
+          docker build -f tools/EventProcessor.LoadGen/Dockerfile -t event-pipeline-loadgen:local .
 
       - uses: helm/kind-action@v1.10.0
         with:
           cluster_name: ci
 
       - name: Load images into the cluster
-        run: kind load docker-image event-pipeline-api:local event-pipeline-worker:local --name ci
+        run: kind load docker-image event-pipeline-api:local event-pipeline-worker:local event-pipeline-loadgen:local --name ci
 
       - name: Deploy
         run: |
@@ -66,6 +67,59 @@ jobs:
         run: |
           kubectl -n event-pipeline exec statefulset/kafka -- \
             /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group event-processor
+
+      - name: Benchmark - direct Kafka ingest, 1M events
+        run: |
+          NS=event-pipeline
+          TOTAL=1000000
+          # Switch the API to the high-throughput path and give it a second replica
+          kubectl -n $NS set env deployment/api Ingest__Mode=Direct
+          kubectl -n $NS scale deployment/api --replicas=2
+          kubectl -n $NS scale deployment/worker --replicas=3
+          kubectl -n $NS rollout status deployment/api --timeout=180s
+          kubectl -n $NS rollout status deployment/worker --timeout=180s
+
+          START=$(date +%s.%N)
+          kubectl apply -f k8s/loadtest/loadgen-job.yaml
+          # Stop on whichever comes first: the job completing or failing
+          kubectl -n $NS wait --for=condition=complete job/loadgen --timeout=900s &
+          kubectl -n $NS wait --for=condition=failed job/loadgen --timeout=900s && { kubectl -n $NS logs job/loadgen | tail -40; exit 1; } &
+          wait -n
+          kill $(jobs -p) 2>/dev/null || true
+          INGEST_DONE=$(date +%s.%N)
+          kubectl -n $NS logs job/loadgen | tail -25
+          LOADGEN=$(kubectl -n $NS logs job/loadgen | grep LOADGEN_RESULT)
+
+          for attempt in $(seq 1 450); do
+            STORED=$(kubectl -n $NS exec statefulset/postgres -- psql -U postgres -tAc "SELECT count(*) FROM events WHERE type = 'load.test'")
+            [ "$STORED" -ge "$TOTAL" ] && break
+            sleep 2
+          done
+          END=$(date +%s.%N)
+          echo "stored: $STORED / $TOTAL"
+
+          INGEST_RATE=$(echo "$LOADGEN" | sed -E 's/.*rate=([0-9]+).*/\1/')
+          E2E_SECONDS=$(awk "BEGIN { printf \"%.1f\", $END - $START }")
+          E2E_RATE=$(awk "BEGIN { printf \"%.0f\", $STORED / ($END - $START) }")
+          CPUS=$(nproc)
+
+          {
+            echo "## Throughput benchmark (single kind node, $CPUS vCPU GitHub runner)"
+            echo ""
+            echo "| Metric | Result |"
+            echo "|---|---|"
+            echo "| Events sent | $TOTAL |"
+            echo "| Events stored in PostgreSQL | $STORED |"
+            echo "| API accepted (HTTP -> Kafka, acks=all) | **$INGEST_RATE events/sec** |"
+            echo "| End to end (HTTP -> Kafka -> worker -> PostgreSQL) | **$E2E_RATE events/sec** ($E2E_SECONDS s) |"
+            echo "| Pods | api x2, worker x3, 12 partitions, everything on one node |"
+          } | tee -a $GITHUB_STEP_SUMMARY
+
+          [ "$STORED" -ge "$TOTAL" ]
+
+      - name: Worker batch timings
+        if: always()
+        run: kubectl -n event-pipeline logs deployment/worker --tail=15 | grep BATCH_COMPLETE || true
 
       - name: Diagnostics
         if: failure()

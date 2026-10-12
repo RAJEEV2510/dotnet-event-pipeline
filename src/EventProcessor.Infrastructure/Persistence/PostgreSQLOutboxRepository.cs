@@ -46,7 +46,7 @@ namespace EventProcessor.Infrastructure.Persistence
                 await writer.WriteAsync(message.EventId, NpgsqlDbType.Uuid, ct);
                 await writer.WriteAsync(message.Type, NpgsqlDbType.Text, ct);
                 await writer.WriteAsync(message.Content, NpgsqlDbType.Text, ct);
-                await writer.WriteAsync(message.CreatedAt, NpgsqlDbType.Timestamp, ct);
+                await writer.WriteAsync(message.CreatedAt.Kind == DateTimeKind.Unspecified ? DateTime.SpecifyKind(message.CreatedAt, DateTimeKind.Utc) : message.CreatedAt.ToUniversalTime(), NpgsqlDbType.TimestampTz, ct);
                 await writer.WriteAsync(0, NpgsqlDbType.Integer, ct);
             }
 

@@ -15,3 +15,63 @@ jobs:
           dotnet-version: 8.0.x
       - run: dotnet restore
       - run: dotnet build --no-restore -c Release
+
+  # End-to-end test: deploy the whole pipeline (Postgres, Kafka, API, worker) to a throwaway
+  # kind cluster, push events through the API and check they land in PostgreSQL.
+  kubernetes:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: |
+          docker build -f src/EventProcessor.Api/Dockerfile -t event-pipeline-api:local .
+          docker build -f src/EventProcessor.Worker/Dockerfile -t event-pipeline-worker:local .
+
+      - uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: ci
+
+      - name: Load images into the cluster
+        run: kind load docker-image event-pipeline-api:local event-pipeline-worker:local --name ci
+
+      - name: Deploy
+        run: |
+          kubectl apply -k .
+          kubectl -n event-pipeline rollout status statefulset/postgres --timeout=180s
+          kubectl -n event-pipeline rollout status statefulset/kafka --timeout=300s
+          kubectl -n event-pipeline rollout status deployment/api --timeout=180s
+          kubectl -n event-pipeline rollout status deployment/worker --timeout=180s
+
+      - name: Send events and verify they reach PostgreSQL
+        run: |
+          kubectl -n event-pipeline port-forward svc/api 8080:80 > /dev/null 2>&1 &
+          sleep 5
+          COUNT=500
+          for i in $(seq 1 $COUNT); do
+            curl -sf -o /dev/null -X POST http://localhost:8080/api/events \
+              -H 'Content-Type: application/json' \
+              -d "{\"eventId\":\"$(cat /proc/sys/kernel/random/uuid)\",\"type\":\"ci.k8s\",\"payload\":\"{\\\"n\\\":$i}\",\"createdAt\":\"$(date -u +%FT%TZ)\"}"
+          done
+          for attempt in $(seq 1 60); do
+            STORED=$(kubectl -n event-pipeline exec statefulset/postgres -- psql -U postgres -tAc "SELECT count(*) FROM events WHERE type = 'ci.k8s'")
+            echo "stored: $STORED / $COUNT"
+            [ "$STORED" -ge "$COUNT" ] && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Show consumer-group partition split across worker pods
+        run: |
+          kubectl -n event-pipeline exec statefulset/kafka -- \
+            /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group event-processor
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          kubectl -n event-pipeline get pods -o wide
+          kubectl -n event-pipeline logs deployment/api --tail=200 || true
+          kubectl -n event-pipeline logs deployment/worker --tail=200 --all-containers || true
+          kubectl -n event-pipeline logs statefulset/kafka --tail=100 || true
+          kubectl -n event-pipeline logs statefulset/postgres --tail=100 || true

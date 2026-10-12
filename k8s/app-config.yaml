@@ -1,0 +1,20 @@
+# Settings shared by the API and the worker. ASP.NET Core maps "Section__Key" env vars onto appsettings.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: event-pipeline-config
+data:
+  Messaging__Transport: "Kafka"
+  Kafka__BootstrapServers: "kafka:9092"
+  Kafka__Topic: "events"
+  Kafka__DeadLetterTopic: "events-dlq"
+  Kafka__GroupId: "event-processor"
+  Kafka__Partitions: "6"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: event-pipeline-db
+type: Opaque
+stringData:
+  PostgreSQL__ConnectionString: "Host=postgres;Port=5432;Database=postgres;Username=postgres;Password=password;"
